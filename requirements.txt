@@ -7,3 +7,4 @@ Flask>=2.0.0
 requests>=2.25.0
 tqdm>=4.60.0
 flask-Cors>=3.0.10
+gunicorn==21.2.0 
