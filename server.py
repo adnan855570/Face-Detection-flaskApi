@@ -4,15 +4,18 @@ import torch
 import numpy as np
 import torch.nn.functional as F
 from flask import Flask, request, jsonify
+from flask_cors import CORS
+
 from src.anti_spoof_predict import Detection, AntiSpoofPredict
 from src.data_io import transform as trans
-from flask_cors import CORS
 
 # --------------------------
 # Config
 # --------------------------
-MODEL_DIR = "./resources/anti_spoof_models" 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_DIR = os.path.join(BASE_DIR, "resources", "anti_spoof_models")
 DEVICE_ID = 0  # GPU id, or CPU fallback
+
 app = Flask(__name__)
 CORS(app)  # allow cross-origin requests
 
@@ -20,6 +23,13 @@ CORS(app)  # allow cross-origin requests
 # Load Models
 # --------------------------
 predictor = AntiSpoofPredict(device_id=DEVICE_ID)
+
+# Debug: list contents of model directory
+if os.path.exists(MODEL_DIR):
+    print(f"[DEBUG] MODEL_DIR = {MODEL_DIR}")
+    print(f"[DEBUG] Files in MODEL_DIR: {os.listdir(MODEL_DIR)}")
+else:
+    print(f"[ERROR] MODEL_DIR does not exist: {MODEL_DIR}")
 
 model_paths = [
     os.path.join(MODEL_DIR, m)
@@ -30,28 +40,36 @@ model_paths = [
 models = []
 for path in model_paths:
     try:
-        net, size = predictor._load_model(path)  # returns (model, input_size)
+        result = predictor._load_model(path)
+        if result is None:
+            raise ValueError("Model loader returned None")
+        net, size = result
         net.eval()
         models.append((net, size))
         print(f"[INFO] Loaded model: {path}, input size: {size}")
     except Exception as e:
         print(f"[ERROR] Failed to load {path}: {e}")
 
-# face detector
+# Face detector
 detector = Detection()
 
-# preprocessing
+# Preprocessing
 to_tensor = trans.Compose([trans.ToTensor()])
 
 
 def preprocess(img, bbox, input_size):
     """Crop, resize, tensorize"""
-    x, y, w, h = bbox
+    x, y, w, h = map(int, bbox)
     face = img[y:y + h, x:x + w]
     face = cv2.resize(face, input_size)
     tensor = to_tensor(face)
     tensor = tensor.unsqueeze(0).to(predictor.device)
     return tensor
+
+
+@app.route("/healthz", methods=["GET"])
+def healthz():
+    return {"status": "ok"}, 200
 
 
 @app.route("/predict", methods=["POST"])
@@ -76,13 +94,16 @@ def predict():
     all_scores = []
     with torch.no_grad():
         for net, input_size in models:
-            tensor = preprocess(img, bbox, input_size)
-            result = net(tensor)
-            result = F.softmax(result, dim=1).cpu().numpy().flatten()
-            all_scores.append(result)
+            try:
+                tensor = preprocess(img, bbox, input_size)
+                result = net(tensor)
+                result = F.softmax(result, dim=1).cpu().numpy().flatten()
+                all_scores.append(result)
+            except Exception as e:
+                print(f"[ERROR] Inference failed on model {net}: {e}")
 
     if not all_scores:
-        return jsonify({"error": "No models loaded"}), 500
+        return jsonify({"error": "No models loaded or inference failed"}), 500
 
     # average scores
     avg_scores = np.mean(all_scores, axis=0)
@@ -92,7 +113,8 @@ def predict():
     return jsonify({
         "label": label,          # 0 = spoof, 1 = live
         "confidence": confidence,
-        "raw_scores": avg_scores.tolist()
+        "raw_scores": avg_scores.tolist(),
+        "bbox": [int(v) for v in bbox]
     })
 
 
